@@ -31,7 +31,14 @@ fn handle_connection(mut stream: TcpStream) {
 
     println!("Request: {:#?}", http_request);
 
-    let response = "HTTP/1.1 200 OK\r\n\r\n";
+    let start_line = http_request.first().unwrap();
+    let path = start_line.split_whitespace().nth(1).unwrap();
+    let response: &str;
+    if path == "/" {
+        response = "HTTP/1.1 200 OK\r\n\r\n";
+    } else {
+        response = "HTTP/1.1 404 Not Found\r\n\r\n";
+    }
 
     stream.write_all(response.as_bytes()).unwrap();
 }
