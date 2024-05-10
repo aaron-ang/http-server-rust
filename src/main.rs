@@ -33,12 +33,21 @@ fn handle_connection(mut stream: TcpStream) {
 
     let start_line = http_request.first().unwrap();
     let path = start_line.split_whitespace().nth(1).unwrap();
-    let response: &str;
-    if path == "/" {
-        response = "HTTP/1.1 200 OK\r\n\r\n";
-    } else {
-        response = "HTTP/1.1 404 Not Found\r\n\r\n";
-    }
+    let response = match path {
+        "/" => "HTTP/1.1 200 OK\r\n\r\n".to_string(),
+        path if path.starts_with("/echo") => handle_echo_endpoint(path),
+        _ => "HTTP/1.1 404 Not Found\r\n\r\n".to_string(),
+    };
 
     stream.write_all(response.as_bytes()).unwrap();
+}
+
+fn handle_echo_endpoint(path: &str) -> String {
+    let string = path.split('/').last().unwrap();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length:{}\r\n\r\n{}",
+        string.len(),
+        string
+    );
+    response
 }
