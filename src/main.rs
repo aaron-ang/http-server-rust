@@ -1,34 +1,31 @@
-use std::{
-    collections::HashMap,
-    io::{prelude::*, BufReader},
-    net::{TcpListener, TcpStream},
-};
+use async_std::{io::BufReader, net::TcpListener, net::TcpStream, prelude::*};
+use futures::future;
+use futures::stream::StreamExt;
+use std::collections::HashMap;
 
-fn main() {
+#[async_std::main]
+async fn main() {
     println!("Logs from your program will appear here!");
 
-    let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:4221").await.unwrap();
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(_stream) => {
-                println!("accepted new connection");
-                handle_connection(_stream);
-            }
-            Err(e) => {
-                println!("error: {}", e);
-            }
-        }
-    }
+    listener
+        .incoming()
+        .for_each_concurrent(/* limit */ None, |tcpstream| async move {
+            let tcpstream = tcpstream.unwrap();
+            handle_connection(tcpstream).await;
+        })
+        .await;
 }
 
-fn handle_connection(mut stream: TcpStream) {
+async fn handle_connection(mut stream: TcpStream) {
     let buf_reader = BufReader::new(&mut stream);
     let http_request: Vec<_> = buf_reader
         .lines()
         .map(|result| result.unwrap())
-        .take_while(|line| !line.is_empty())
-        .collect();
+        .take_while(|line| future::ready(!line.is_empty()))
+        .collect()
+        .await;
 
     println!("Request: {:#?}", http_request);
 
@@ -51,7 +48,8 @@ fn handle_connection(mut stream: TcpStream) {
         _ => "HTTP/1.1 404 Not Found\r\n\r\n".to_string(),
     };
 
-    stream.write_all(response.as_bytes()).unwrap();
+    stream.write_all(response.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
 }
 
 fn handle_echo_endpoint(path: &str) -> String {
