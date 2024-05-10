@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{prelude::*, BufReader},
     net::{TcpListener, TcpStream},
 };
@@ -33,9 +34,20 @@ fn handle_connection(mut stream: TcpStream) {
 
     let start_line = http_request.first().unwrap();
     let path = start_line.split_whitespace().nth(1).unwrap();
+    let headers: HashMap<&str, &str> = http_request[1..]
+        .iter()
+        .map(|line| {
+            let mut parts = line.splitn(2, ": ");
+            (parts.next().unwrap(), parts.next().unwrap())
+        })
+        .collect();
+
     let response = match path {
         "/" => "HTTP/1.1 200 OK\r\n\r\n".to_string(),
-        path if path.starts_with("/echo") => handle_echo_endpoint(path),
+        p if p.starts_with("/echo") => handle_echo_endpoint(p),
+        p if p.starts_with("/user-agent") => {
+            handle_user_agent_endpoint(headers.get("User-Agent").unwrap())
+        }
         _ => "HTTP/1.1 404 Not Found\r\n\r\n".to_string(),
     };
 
@@ -48,6 +60,15 @@ fn handle_echo_endpoint(path: &str) -> String {
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length:{}\r\n\r\n{}",
         string.len(),
         string
+    );
+    response
+}
+
+fn handle_user_agent_endpoint(user_agent: &str) -> String {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length:{}\r\n\r\n{}",
+        user_agent.len(),
+        user_agent
     );
     response
 }
