@@ -36,7 +36,7 @@ async fn handle_connection(mut stream: TcpStream, directory: &str) {
         .take_while(|l| future::ready(!l.is_empty()))
         .collect()
         .await;
-    let body = http_request_raw[http_request.join("\r\n").len() + 4..].to_vec();
+    let body = parse_body(http_request_raw, http_request.join("\r\n").len());
 
     println!("Request: {:#?}", http_request);
     println!("Body: {:#?}", String::from_utf8_lossy(&body));
@@ -54,7 +54,7 @@ async fn handle_connection(mut stream: TcpStream, directory: &str) {
 
     let response = match path {
         "/" => "HTTP/1.1 200 OK\r\n\r\n".to_string(),
-        p if p.starts_with("/echo") => handle_echo_endpoint(p),
+        p if p.starts_with("/echo") => handle_echo_endpoint(p, headers),
         p if p.starts_with("/user-agent") => {
             handle_user_agent_endpoint(headers.get("User-Agent").unwrap())
         }
@@ -66,13 +66,33 @@ async fn handle_connection(mut stream: TcpStream, directory: &str) {
     stream.flush().await.unwrap();
 }
 
-fn handle_echo_endpoint(path: &str) -> String {
+fn parse_body(http_request_raw: &[u8], mut start_idx: usize) -> Vec<u8> {
+    while start_idx < http_request_raw.len()
+        && (http_request_raw[start_idx] == b'\r' || http_request_raw[start_idx] == b'\n')
+    {
+        start_idx += 1;
+    }
+    if start_idx >= http_request_raw.len() {
+        return vec![];
+    }
+    http_request_raw[start_idx..].to_vec()
+}
+
+fn handle_echo_endpoint(path: &str, headers: Headers) -> String {
     let string = path.split('/').last().unwrap();
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length:{}\r\n\r\n{}",
+    let mut response = "HTTP/1.1 200 OK\r\n".to_string();
+    if headers.contains_key("Accept-Encoding") {
+        let encoding = headers.get("Accept-Encoding").unwrap();
+        if encoding.contains("gzip") {
+            response.push_str("Content-Encoding: gzip\r\n");
+        }
+        // response.push_str(&format!("Content-Encoding: {}\r\n", encoding));
+    }
+    response.push_str(&format!(
+        "Content-Type: text/plain\r\nContent-Length:{}\r\n\r\n{}",
         string.len(),
         string
-    );
+    ));
     response
 }
 
