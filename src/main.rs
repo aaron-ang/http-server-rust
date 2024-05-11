@@ -1,7 +1,7 @@
 use async_std::{io::BufReader, net::TcpListener, net::TcpStream, prelude::*};
-use futures::stream::StreamExt;
-use futures::{future, AsyncBufReadExt};
-use std::{collections::HashMap, env, fs};
+use flate2::{write::GzEncoder, Compression};
+use futures::{future, stream::StreamExt, AsyncBufReadExt};
+use std::{collections::HashMap, env, fs, io::Write};
 
 type Headers<'a> = HashMap<&'a str, &'a str>;
 
@@ -79,14 +79,22 @@ fn parse_body(http_request_raw: &[u8], mut start_idx: usize) -> Vec<u8> {
 }
 
 fn handle_echo_endpoint(path: &str, headers: Headers) -> String {
-    let string = path.split('/').last().unwrap();
+    let mut string = path.split('/').last().unwrap().to_string();
     let mut response = "HTTP/1.1 200 OK\r\n".to_string();
+    let mut compressed: Option<Vec<u8>> = None;
+
     if headers.contains_key("Accept-Encoding") {
         let encoding = headers.get("Accept-Encoding").unwrap();
         if encoding.contains("gzip") {
             response.push_str("Content-Encoding: gzip\r\n");
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(string.as_bytes()).unwrap();
+            compressed = Some(encoder.finish().unwrap());
         }
-        // response.push_str(&format!("Content-Encoding: {}\r\n", encoding));
+    }
+
+    if let Some(c) = compressed {
+        unsafe { string = String::from_utf8_unchecked(c) }
     }
     response.push_str(&format!(
         "Content-Type: text/plain\r\nContent-Length:{}\r\n\r\n{}",
