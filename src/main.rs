@@ -1,95 +1,112 @@
-use async_std::{io::BufReader, net::TcpListener, net::TcpStream, prelude::*};
+use async_std::{
+    io::BufReader,
+    net::{TcpListener, TcpStream},
+    prelude::*,
+};
 use flate2::{write::GzEncoder, Compression};
-use futures::{future, stream::StreamExt, AsyncBufReadExt};
-use std::{collections::HashMap, env, fs, io::Write};
+use futures::{stream::StreamExt, AsyncBufReadExt};
+use httparse::{Header, Request};
+use std::{env, fs, io::Write};
 
-type Headers<'a> = HashMap<&'a str, &'a str>;
-
-static PORT: &str = "4221";
+static PORT: u16 = 4221;
 
 #[async_std::main]
 async fn main() {
-    let args: Vec<String> = env::args().collect();
-    let directory = if args.len() > 2 { &args[2] } else { "." };
-
+    let directory = parse_args_for_directory();
     let listener = TcpListener::bind(format!("127.0.0.1:{PORT}"))
         .await
         .unwrap();
-
     println!("Server listening on port {PORT}, using directory: {directory}");
 
     listener
         .incoming()
-        .for_each_concurrent(/* limit */ None, |tcpstream| async move {
-            let tcpstream = tcpstream.unwrap();
-            handle_connection(tcpstream, directory).await;
+        .for_each_concurrent(/* limit */ None, |tcpstream| {
+            let directory = directory.clone();
+            async move {
+                match tcpstream {
+                    Ok(tcpstream) => {
+                        handle_connection(tcpstream, directory)
+                            .await
+                            .unwrap_or_else(|e| {
+                                eprintln!("Failed to handle connection: {}", e);
+                            });
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to establish connection: {}", e);
+                    }
+                }
+            }
         })
         .await;
 }
 
-async fn handle_connection(mut stream: TcpStream, directory: &str) {
-    let mut buf_reader = BufReader::new(&mut stream);
-    assert!(buf_reader.fill_buf().await.is_ok());
-    let http_request_raw = buf_reader.buffer();
-    let http_request_top = AsyncBufReadExt::lines(http_request_raw).map(|l| l.unwrap());
-    let http_request: Vec<String> = http_request_top
-        .take_while(|l| future::ready(!l.is_empty()))
-        .collect()
-        .await;
-    let body = parse_body(http_request_raw, http_request.join("\r\n").len());
+fn parse_args_for_directory() -> String {
+    let args: Vec<String> = env::args().collect();
+    let directory = if args.len() > 2 && args[1] == "--directory" {
+        args[2].clone()
+    } else {
+        ".".to_string()
+    };
+    directory
+}
 
-    println!("Request: {:#?}", http_request);
+async fn handle_connection(mut stream: TcpStream, directory: String) -> Result<(), std::io::Error> {
+    let mut buf_reader = BufReader::new(&mut stream);
+    let buf = buf_reader.fill_buf().await?;
+    let mut headers = [httparse::EMPTY_HEADER; 16];
+    let mut req = Request::new(&mut headers);
+    let res = req.parse(buf).unwrap();
+    let body = buf[res.unwrap()..].to_vec();
+
+    println!("Headers: {:#?}", req.headers);
     println!("Body: {:#?}", String::from_utf8_lossy(&body));
 
-    let mut start_line = http_request.first().unwrap().split_whitespace();
-    let method = start_line.next().unwrap();
-    let path = start_line.next().unwrap();
-    let headers: Headers = http_request[1..]
-        .iter()
-        .map(|line| {
-            let mut parts = line.splitn(2, ": ");
-            (parts.next().unwrap(), parts.next().unwrap())
-        })
-        .collect();
-
+    let path = req.path;
     let response = match path {
-        "/" => "HTTP/1.1 200 OK\r\n\r\n".to_string(),
-        p if p.starts_with("/echo") => handle_echo_endpoint(p, headers),
-        p if p.starts_with("/user-agent") => {
-            handle_user_agent_endpoint(headers.get("User-Agent").unwrap())
+        None => "HTTP/1.1 400 Bad Request\r\n\r\n".to_string(),
+        Some(p) => {
+            if p == "/" {
+                "HTTP/1.1 200 OK\r\n\r\n".to_string()
+            } else if p.starts_with("/echo") {
+                match handle_echo_endpoint(p, req.headers) {
+                    Ok(response) => response,
+                    Err(_) => "HTTP/1.1 500 Internal Server Error\r\n\r\n".to_string(),
+                }
+            } else if p.starts_with("/user-agent") {
+                handle_user_agent_endpoint(req.headers)
+            } else if p.starts_with("/files") {
+                handle_files_endpoint(req, directory, body)
+            } else {
+                "HTTP/1.1 404 Not Found\r\n\r\n".to_string()
+            }
         }
-        p if p.starts_with("/files") => handle_files_endpoint(method, directory, p, body),
-        _ => "HTTP/1.1 404 Not Found\r\n\r\n".to_string(),
     };
 
-    stream.write_all(response.as_bytes()).await.unwrap();
-    stream.flush().await.unwrap();
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
 }
 
-fn parse_body(http_request_raw: &[u8], mut start_idx: usize) -> Vec<u8> {
-    while start_idx < http_request_raw.len()
-        && (http_request_raw[start_idx] == b'\r' || http_request_raw[start_idx] == b'\n')
-    {
-        start_idx += 1;
+fn find_header_value(headers: &[Header], key: &str) -> Option<String> {
+    for header in headers {
+        if header.name.to_lowercase() == key.to_lowercase() {
+            return Some(String::from_utf8_lossy(header.value).to_string());
+        }
     }
-    if start_idx >= http_request_raw.len() {
-        return vec![];
-    }
-    http_request_raw[start_idx..].to_vec()
+    None
 }
 
-fn handle_echo_endpoint(path: &str, headers: Headers) -> String {
+fn handle_echo_endpoint(path: &str, headers: &[Header]) -> Result<String, std::io::Error> {
     let mut string = path.split('/').last().unwrap().to_string();
     let mut response = "HTTP/1.1 200 OK\r\n".to_string();
     let mut compressed: Option<Vec<u8>> = None;
 
-    if headers.contains_key("Accept-Encoding") {
-        let encoding = headers.get("Accept-Encoding").unwrap();
+    if let Some(encoding) = find_header_value(headers, "Accept-Encoding") {
         if encoding.contains("gzip") {
             response.push_str("Content-Encoding: gzip\r\n");
             let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-            encoder.write_all(string.as_bytes()).unwrap();
-            compressed = Some(encoder.finish().unwrap());
+            encoder.write_all(string.as_bytes()).map_err(|e| e)?;
+            compressed = Some(encoder.finish().map_err(|e| e)?);
         }
     }
 
@@ -101,19 +118,23 @@ fn handle_echo_endpoint(path: &str, headers: Headers) -> String {
         string.len(),
         string
     ));
-    response
+    Ok(response)
 }
 
-fn handle_user_agent_endpoint(user_agent: &str) -> String {
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length:{}\r\n\r\n{}",
-        user_agent.len(),
-        user_agent
-    );
-    response
+fn handle_user_agent_endpoint(headers: &[Header]) -> String {
+    match find_header_value(headers, "User-Agent") {
+        Some(user_agent) => format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length:{}\r\n\r\n{}",
+            user_agent.len(),
+            user_agent
+        ),
+        None => "HTTP/1.1 400 Bad Request\r\n\r\n".to_string(),
+    }
 }
 
-fn handle_files_endpoint(method: &str, directory: &str, path: &str, body: Vec<u8>) -> String {
+fn handle_files_endpoint(req: Request, directory: String, body: Vec<u8>) -> String {
+    let path = req.path.unwrap();
+    let method = req.method.unwrap();
     let file_name = path.split('/').last().unwrap();
     let file_path = format!("{}/{}", directory, file_name);
     let response: String;
