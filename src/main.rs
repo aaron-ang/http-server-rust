@@ -44,44 +44,51 @@ async fn main() -> Result<()> {
 
 async fn handle_connection(mut stream: TcpStream, directory: String) -> Result<()> {
     let mut buf_reader = BufReader::new(&mut stream);
-    let buf = buf_reader.fill_buf().await?;
 
-    let mut headers = [httparse::EMPTY_HEADER; 16];
-    let mut req = Request::new(&mut headers);
-    let res = req.parse(buf)?;
-    let body = match res {
-        Status::Complete(size) => buf[size..].to_vec(),
-        _ => vec![],
-    };
+    loop {
+        let mut headers = [httparse::EMPTY_HEADER; 64];
+        let mut req = Request::new(&mut headers);
+        let req_buf = buf_reader.fill_buf().await?.to_vec();
 
-    println!("Received headers: {:?}", req.headers);
-    println!("Received body: {:?}", String::from_utf8_lossy(&body));
+        let body = match req.parse(&req_buf)? {
+            Status::Complete(size) => {
+                buf_reader.consume(req_buf.len());
+                &req_buf[size..]
+            }
+            _ => continue, // Incomplete request, continue reading
+        };
 
-    let path = req.path;
-    let response = match path {
-        None => HTTP_BAD_REQUEST.to_string(),
-        Some(p) => {
-            if p == "/" {
-                format!("{HTTP_OK}\r\n")
-            } else if p.starts_with("/echo") {
-                match handle_echo_endpoint(p, req.headers) {
-                    Ok(response) => response,
-                    Err(_) => HTTP_INTERNAL_SERVER_ERROR.to_string(),
-                }
-            } else if p.starts_with("/user-agent") {
-                handle_user_agent_endpoint(req.headers)
-            } else if p.starts_with("/files") {
-                handle_files_endpoint(req, &directory, &body).await?
-            } else {
-                HTTP_NOT_FOUND.to_string()
+        // check for "Connection: close"
+        if let Some(conn) = find_header_value(req.headers, "Connection") {
+            if conn == "close" {
+                break;
             }
         }
-    };
 
-    println!("Response: {}", response);
+        let response = match req.path {
+            None => HTTP_BAD_REQUEST.to_string(),
+            Some(path) => {
+                if path == "/" {
+                    format!("{HTTP_OK}\r\n")
+                } else if path.starts_with("/echo") {
+                    match handle_echo_endpoint(path, req.headers) {
+                        Ok(response) => response,
+                        Err(_) => HTTP_INTERNAL_SERVER_ERROR.to_string(),
+                    }
+                } else if path.starts_with("/user-agent") {
+                    handle_user_agent_endpoint(req.headers)
+                } else if path.starts_with("/files") {
+                    handle_files_endpoint(req, &directory, &body).await?
+                } else {
+                    HTTP_NOT_FOUND.to_string()
+                }
+            }
+        };
 
-    stream.write_all(response.as_bytes()).await?;
-    stream.flush().await?;
+        buf_reader.get_mut().write_all(response.as_bytes()).await?;
+        buf_reader.get_mut().flush().await?;
+    }
+
     Ok(())
 }
 
