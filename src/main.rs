@@ -73,32 +73,20 @@ async fn handle_connection(mut stream: TcpStream, directory: PathBuf) -> Result<
             _ => continue, // Incomplete request, continue reading
         };
 
-        let mut response = match req.path {
-            None => Response::bad_request(),
-            Some(path) => {
-                if path == "/" {
-                    Response::ok()
-                } else if path.starts_with("/echo") {
-                    match echo_handler(path, req.headers) {
-                        Ok(response) => response,
-                        Err(_) => Response::internal_server_error()
-                            .with_body("Failed to process echo request"),
-                    }
-                } else if path.starts_with("/user-agent") {
-                    user_agent_handler(req.headers)
-                } else if path.starts_with("/files") {
-                    files_handler(path, req.method.unwrap(), &directory, &body).await?
-                } else {
-                    Response::not_found().with_body("Invalid path")
-                }
-            }
+        // check for "Connection: close"
+        if get_header_value(req.headers, "Connection")
+            .is_some_and(|value| value.to_lowercase() == "close")
+        {
+            keep_alive = false;
         };
 
-        // check for "Connection: close"
-        if let Some(conn) = get_header_value(req.headers, "Connection") {
-            if conn == "close" {
-                keep_alive = false;
-                response = response.connection_close();
+        let response = match handle_request(&req, &directory, body, keep_alive).await {
+            Ok(res) => res,
+            Err(e) => {
+                eprintln!("Error handling request: {}", e);
+                Response::internal_server_error().with_body(
+                    "The server encountered an error and could not complete your request.",
+                )
             }
         };
 
@@ -111,6 +99,30 @@ async fn handle_connection(mut stream: TcpStream, directory: PathBuf) -> Result<
     }
 
     Ok(())
+}
+
+async fn handle_request(
+    request: &Request<'_, '_>,
+    directory: &PathBuf,
+    body: &[u8],
+    keep_alive: bool,
+) -> Result<Response> {
+    let path = request.path.unwrap_or_default();
+    let method = request.method.unwrap_or_default();
+
+    let response = match path {
+        "/" => Response::ok(),
+        p if p.starts_with("/echo") => echo_handler(path, request.headers)?,
+        p if p.starts_with("/user-agent") => user_agent_handler(request.headers),
+        p if p.starts_with("/files") => files_handler(path, method, directory, body).await?,
+        _ => Response::not_found().with_body("Invalid path"),
+    };
+
+    Ok(if !keep_alive {
+        response.connection_close()
+    } else {
+        response
+    })
 }
 
 fn get_header_value(headers: &[Header], key: &str) -> Option<String> {
