@@ -81,14 +81,15 @@ async fn handle_connection(mut stream: TcpStream, directory: PathBuf) -> Result<
                 } else if path.starts_with("/echo") {
                     match echo_handler(path, req.headers) {
                         Ok(response) => response,
-                        Err(_) => Response::internal_server_error(),
+                        Err(_) => Response::internal_server_error()
+                            .with_body("Failed to process echo request"),
                     }
                 } else if path.starts_with("/user-agent") {
                     user_agent_handler(req.headers)
                 } else if path.starts_with("/files") {
                     files_handler(path, req.method.unwrap(), &directory, &body).await?
                 } else {
-                    Response::not_found()
+                    Response::not_found().with_body("Invalid path")
                 }
             }
         };
@@ -122,7 +123,7 @@ fn get_header_value(headers: &[Header], key: &str) -> Option<String> {
 }
 
 fn echo_handler(path: &str, headers: &[Header]) -> Result<Response> {
-    let payload = path.strip_prefix("/echo/").unwrap();
+    let payload = path.strip_prefix("/echo/").unwrap_or_default();
     let content_type = "text/plain";
 
     if let Some(encoding) = get_header_value(headers, "Accept-Encoding") {
@@ -147,7 +148,7 @@ fn user_agent_handler(headers: &[Header]) -> Response {
         Some(user_agent) => Response::ok()
             .with_content_type("text/plain")
             .with_body(user_agent),
-        None => Response::bad_request(),
+        None => Response::bad_request().with_body("User-Agent header not found"),
     }
 }
 
@@ -157,18 +158,22 @@ async fn files_handler(
     directory: &PathBuf,
     body: &[u8],
 ) -> Result<Response> {
-    let file_name = path.strip_prefix("/files/").unwrap();
+    let file_name = path.strip_prefix("/files/").unwrap_or_default();
+    if file_name.is_empty() {
+        return Ok(Response::bad_request().with_body("File name is required"));
+    }
+
     let file_path = directory.join(file_name);
     let response = match method {
         "GET" => match fs::read(file_path).await {
             Ok(content) => Response::ok()
                 .with_content_type("application/octet-stream")
                 .with_body(content),
-            Err(_) => Response::not_found(),
+            Err(_) => Response::not_found().with_body("File not found"),
         },
         "POST" => match fs::write(file_path, body).await {
-            Ok(_) => Response::created(),
-            Err(_) => Response::internal_server_error(),
+            Ok(_) => Response::created().with_body("File created"),
+            Err(_) => Response::internal_server_error().with_body("Failed to create file"),
         },
         _ => Response::method_not_allowed(),
     };
