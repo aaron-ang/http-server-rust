@@ -2,36 +2,46 @@ use anyhow::Result;
 use clap::Parser;
 use flate2::{write::GzEncoder, Compression};
 use httparse::{Header, Request, Status};
-use std::{io::Write, path::Path};
+use std::{io::Write, path::PathBuf, time::Duration};
 use tokio::{
     fs,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
+    time::timeout,
 };
 
 use http_server_starter_rust::*;
+
+const PORT: u16 = 4221;
+const READ_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Parser)]
 struct Cli {
     /// Directory where the files are stored, as an absolute path
     #[arg(long, default_value = ".")]
-    directory: String,
+    directory: PathBuf,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Cli::parse();
     let directory = args.directory;
+
+    println!(
+        "Starting server on port {PORT}, serving files from: {:?}",
+        directory
+    );
+
     let listener = TcpListener::bind(format!("127.0.0.1:{PORT}")).await?;
-    println!("Server listening on port {PORT}, using directory: {directory}");
 
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok((stream, addr)) => {
+                println!("Accepted connection from {}", addr);
                 let directory = directory.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(stream, directory).await {
-                        eprintln!("Failed to handle connection: {}", e);
+                        eprintln!("Connection error: {}", e);
                     }
                 });
             }
@@ -42,132 +52,125 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, directory: String) -> Result<()> {
-    let mut buf_reader = BufReader::new(&mut stream);
+async fn handle_connection(mut stream: TcpStream, directory: PathBuf) -> Result<()> {
+    let mut reader = BufReader::new(&mut stream);
+    let mut keep_alive = true;
 
     loop {
+        let buf = match timeout(Duration::from_secs(READ_TIMEOUT_SECS), reader.fill_buf()).await {
+            Ok(Ok(buf)) => buf.to_vec(),
+            Ok(Err(e)) => return Err(e.into()), // Error reading buffer
+            Err(_) => break,                    // Timeout occurred
+        };
+
         let mut headers = [httparse::EMPTY_HEADER; 64];
         let mut req = Request::new(&mut headers);
-        let req_buf = buf_reader.fill_buf().await?.to_vec();
-
-        let body = match req.parse(&req_buf)? {
+        let body = match req.parse(&buf)? {
             Status::Complete(size) => {
-                buf_reader.consume(req_buf.len());
-                &req_buf[size..]
+                reader.consume(buf.len());
+                &buf[size..]
             }
             _ => continue, // Incomplete request, continue reading
         };
 
-        // check for "Connection: close"
-        if let Some(conn) = find_header_value(req.headers, "Connection") {
-            if conn == "close" {
-                break;
-            }
-        }
-
-        let response = match req.path {
-            None => HTTP_BAD_REQUEST.to_string(),
+        let mut response = match req.path {
+            None => Response::bad_request(),
             Some(path) => {
                 if path == "/" {
-                    format!("{HTTP_OK}\r\n")
+                    Response::ok()
                 } else if path.starts_with("/echo") {
-                    match handle_echo_endpoint(path, req.headers) {
+                    match echo_handler(path, req.headers) {
                         Ok(response) => response,
-                        Err(_) => HTTP_INTERNAL_SERVER_ERROR.to_string(),
+                        Err(_) => Response::internal_server_error(),
                     }
                 } else if path.starts_with("/user-agent") {
-                    handle_user_agent_endpoint(req.headers)
+                    user_agent_handler(req.headers)
                 } else if path.starts_with("/files") {
-                    handle_files_endpoint(req, &directory, &body).await?
+                    files_handler(path, req.method.unwrap(), &directory, &body).await?
                 } else {
-                    HTTP_NOT_FOUND.to_string()
+                    Response::not_found()
                 }
             }
         };
 
-        buf_reader.get_mut().write_all(response.as_bytes()).await?;
-        buf_reader.get_mut().flush().await?;
+        // check for "Connection: close"
+        if let Some(conn) = get_header_value(req.headers, "Connection") {
+            if conn == "close" {
+                keep_alive = false;
+                response = response.connection_close();
+            }
+        };
+
+        reader.get_mut().write_all(&response.as_bytes()).await?;
+        reader.get_mut().flush().await?;
+
+        if !keep_alive {
+            break;
+        }
     }
 
     Ok(())
 }
 
-fn find_header_value(headers: &[Header], key: &str) -> Option<String> {
+fn get_header_value(headers: &[Header], key: &str) -> Option<String> {
     for header in headers {
         if header.name.to_lowercase() == key.to_lowercase() {
-            return Some(String::from_utf8_lossy(header.value).to_string());
+            return Some(String::from_utf8_lossy(&header.value).to_string());
         }
     }
     None
 }
 
-fn handle_echo_endpoint(path: &str, headers: &[Header]) -> Result<String> {
-    let mut payload = path.rsplit('/').next().unwrap().to_string();
-    let mut content_encoding = None;
+fn echo_handler(path: &str, headers: &[Header]) -> Result<Response> {
+    let payload = path.strip_prefix("/echo/").unwrap();
+    let content_type = "text/plain";
 
-    if let Some(encoding) = find_header_value(headers, "Accept-Encoding") {
+    if let Some(encoding) = get_header_value(headers, "Accept-Encoding") {
         if encoding.contains("gzip") {
-            content_encoding = Some("gzip");
             let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
             encoder.write_all(payload.as_bytes())?;
             let compressed = encoder.finish()?;
-            payload = unsafe { String::from_utf8_unchecked(compressed) };
+            return Ok(Response::ok()
+                .with_content_encoding("gzip")
+                .with_content_type(content_type)
+                .with_body(compressed));
         }
     }
 
-    Ok(build_response(
-        HTTP_OK,
-        content_encoding,
-        "text/plain",
-        &payload,
-    ))
+    Ok(Response::ok()
+        .with_content_type("text/plain")
+        .with_body(payload))
 }
 
-fn handle_user_agent_endpoint(headers: &[Header]) -> String {
-    match find_header_value(headers, "User-Agent") {
-        Some(user_agent) => build_response(HTTP_OK, None, "text/plain", &user_agent),
-        None => HTTP_BAD_REQUEST.to_string(),
+fn user_agent_handler(headers: &[Header]) -> Response {
+    match get_header_value(headers, "User-Agent") {
+        Some(user_agent) => Response::ok()
+            .with_content_type("text/plain")
+            .with_body(user_agent),
+        None => Response::bad_request(),
     }
 }
 
-async fn handle_files_endpoint<'a>(
-    req: Request<'a, 'a>,
-    directory: &str,
+async fn files_handler(
+    path: &str,
+    method: &str,
+    directory: &PathBuf,
     body: &[u8],
-) -> Result<String> {
-    let path = req.path.unwrap();
-    let method = req.method.unwrap();
-    let file_name = path.rsplit('/').next().unwrap();
-    let file_path = Path::new(directory).join(file_name);
-
-    let response = if method == "POST" {
-        match fs::write(file_path, body).await {
-            Ok(_) => HTTP_CREATED.to_string(),
-            Err(_) => HTTP_INTERNAL_SERVER_ERROR.to_string(),
-        }
-    } else {
-        match fs::read_to_string(file_path).await {
-            Ok(content) => build_response(HTTP_OK, None, "application/octet-stream", &content),
-            Err(_) => HTTP_NOT_FOUND.to_string(),
-        }
+) -> Result<Response> {
+    let file_name = path.strip_prefix("/files/").unwrap();
+    let file_path = directory.join(file_name);
+    let response = match method {
+        "GET" => match fs::read(file_path).await {
+            Ok(content) => Response::ok()
+                .with_content_type("application/octet-stream")
+                .with_body(content),
+            Err(_) => Response::not_found(),
+        },
+        "POST" => match fs::write(file_path, body).await {
+            Ok(_) => Response::created(),
+            Err(_) => Response::internal_server_error(),
+        },
+        _ => Response::method_not_allowed(),
     };
     Ok(response)
-}
-
-fn build_response(
-    status: &str,
-    content_encoding: Option<&str>,
-    content_type: &str,
-    body: &str,
-) -> String {
-    let content_encoding_header = if let Some(encoding) = content_encoding {
-        format!("Content-Encoding: {}\r\n", encoding)
-    } else {
-        String::new()
-    };
-    format!(
-        "{status}{content_encoding_header}Content-Type: {content_type}\r\nContent-Length:{}\r\n\r\n{}",
-        body.len(),
-        body,
-    )
 }
